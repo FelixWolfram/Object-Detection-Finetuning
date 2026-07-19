@@ -24,12 +24,11 @@ DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_av
 # -------------- Classes --------------
 
 class CustomImageDataset(Dataset):
-    def __init__(self, annotations_dir, img_dir, transform=None, img_transform=None):
+    def __init__(self, annotations_dir, img_dir, transform=None):
         self.annotations_dir = annotations_dir
         self.annot_file_names = os.listdir(self.annotations_dir)
         self.img_dir = img_dir
         self.transform = transform  # v2 transformations which will be applied to image + label
-        self.img_transform = img_transform # normal transformations (which will be also applied to validation + test) like resize, crop and normalization
 
     def __len__(self):
         return len(self.annot_file_names)
@@ -65,20 +64,17 @@ class CustomImageDataset(Dataset):
                 yolo_boxes = torch.cat((classes, relative_bboxes), dim=1) # dim=1 to concatenate along the columns 
             else:
                 image = self.transform(image) # if there are no bounding boxes, just transform the image
-        if self.img_transform:
-            # preprocess transformations like normalize, which will not affect the label
-            image = self.img_transform(image)
         return image, yolo_boxes
 
 
 class ObjectDetectionHead(nn.Module):
-    def __init__(self):
+    def __init__(self, out_channels):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels=2048, out_channels=2048, kernel_size=3, padding=1, bias=False)
         self.batchnorm1 = nn.BatchNorm2d(2048)
         self.conv2 = nn.Conv2d(in_channels=2048, out_channels=2048, kernel_size=3, padding=1, bias=False)
         self.batchnorm2 = nn.BatchNorm2d(2048)
-        self.outputmapping = nn.Conv2d(in_channels=2048, out_channels=20, kernel_size=1, bias=True)
+        self.outputmapping = nn.Conv2d(in_channels=2048, out_channels=out_channels, kernel_size=1, bias=True)
 
 
     def forward(self, x):
@@ -93,7 +89,7 @@ class ObjectDetectionHead(nn.Module):
 
 # -------------- Model --------------
 
-def load_initial_model_and_transform(frozen: bool = True) -> tuple[ResNet, v2.Compose, int]:
+def load_initial_model_and_transform(device, frozen: bool = True) -> tuple[ResNet, v2.Compose, int]:
     # load the preprocessing transforms from the weights
     preprocess = WEIGHTS.transforms()
     # extract elements from preprocess to use them with v2 (so labels and images can be transformed together)
@@ -106,11 +102,15 @@ def load_initial_model_and_transform(frozen: bool = True) -> tuple[ResNet, v2.Co
     model_transform = v2.Compose([
         v2.Resize(resize_size),
         v2.CenterCrop(crop_size),
+        v2.ToDtype(torch.float32, scale=True), # also scale the image to [0, 1] from [0, 255] after loading the image
         v2.Normalize(mean=mean, std=std)
     ])
+    # add mean and std to the model_transform object so they can be used for setting the correct mean and std for the training transformation object and later visualization
+    model_transform.mean = mean
+    model_transform.std = std
 
     # load model, either frozen or unfrozen 
-    model = resnet50(weights=WEIGHTS) 
+    model = resnet50(weights=WEIGHTS).to(device)
     if frozen:
         for param in model.parameters():
             param.requires_grad = False # freeze the parameters of the model to only train the new layers for object detection first
@@ -118,16 +118,17 @@ def load_initial_model_and_transform(frozen: bool = True) -> tuple[ResNet, v2.Co
     return model, model_transform, crop_size
 
 
-def load_ObjDet_model(frozen: bool = True):
+def load_ObjDet_model(num_classes: int, B: int = 1, frozen: bool = True, device: str = DEVICE) -> tuple[nn.Module, v2.Compose, int]:
     """
     Loads the initial model and swaps the classification head with the object detection head.
     Returns the modified model, the preprocessing transforms for the ResNet50 model and the image size after the preprocessing transformations.
     """
-    model, test_transform, image_size = load_initial_model_and_transform(frozen=frozen)
+    model, test_transform, image_size = load_initial_model_and_transform(frozen=frozen, device=device)
     # get all the elements of the network as a list => the last two layers (avg_pool and fc) are then stripped including the forward pass of those modules
     model = nn.Sequential(*list(model.children())[:-2])
     # add the object detection head to the model
-    model.add_module("Object Detection Head", ObjectDetectionHead())
+    model.add_module("Object Detection Head", ObjectDetectionHead(out_channels=num_classes + 5 * B))
+    model = model.to(device)
     return model, test_transform, image_size
 
 
@@ -137,12 +138,14 @@ def load_default_train_transforms(image_size: int, test_transform: v2.Compose) -
     """
     Loads the default training transformations for the object detection model. 
     Includes random resized crop, random perspective, color jitter and random grayscale.
-    """
+    """    
     train_transforms = v2.Compose([
         v2.RandomResizedCrop(image_size, (0.6, 1)),
         v2.RandomPerspective(0.75, 0.2),
         v2.ColorJitter(0.3, 0.2, 0.2, 0.1),
-        v2.RandomGrayscale(0.1)
+        v2.RandomGrayscale(0.1),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=test_transform.mean, std=test_transform.std)
     ])
 
     return train_transforms
@@ -158,13 +161,13 @@ def load_default_datasets(train_transform: v2.Compose, test_transform: v2.Compos
     val_dataset =  CustomImageDataset(
         annotations_dir=f"{dataset_path}/valid/labels",
         img_dir=f"{dataset_path}/valid/images",
-        img_transform=test_transform
+        transform=test_transform
     )
 
     test_dataset =  CustomImageDataset(
         annotations_dir=f"{dataset_path}/test/labels",
         img_dir=f"{dataset_path}/test/images",
-        img_transform=test_transform
+        transform=test_transform
     )
 
     return train_dataset, val_dataset, test_dataset
@@ -192,7 +195,8 @@ def load_default_dataloaders(batch_size: int, num_workers: int, image_size: int,
 
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+    # shuffle = True on test_dataloader to get a random sample of images for visualization
 
     return train_dataloader, val_dataloader, test_dataloader
 
@@ -325,7 +329,7 @@ def calc_detection_loss(
     
     loss_obj = objectness_loss(pred, target_obj, no_obj_w=no_obj_w)
     loss_class = classification_loss(pred, target_class)
-    loss_loc = localization_loss(pred, target_loc, img_size=img_size, map_size=map_size, target_obj=target_obj, l2_factor=loc_l2_factor)
+    loss_loc = localization_loss(pred, target_loc, img_size=img_size, map_size=map_size, target_obj=target_obj, loc_l2_factor=loc_l2_factor)
 
 
     loss = obj_w * loss_obj + class_w * loss_class + loc_w * loss_loc
@@ -345,7 +349,7 @@ def train_loop(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim.
         X, y = torch.stack(batch[0]).to(device), batch[1]
 
         pred = model(X)
-        loss, loss_obj, loss_class, loss_loc = calc_detection_loss(pred, y)
+        loss, loss_obj, loss_class, loss_loc = calc_detection_loss(pred, y, img_size=X.shape[-1])
 
         loss.backward()
         optimizer.step()
@@ -442,7 +446,7 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, wandb_projec
     return train_losses, val_losses, best_val_loss
 
 
-# -------------- Visualization --------------
+# -------------- Visualizations --------------
 
 def get_box_coords(box, image_size):
     class_id, x_c, y_c, w, h = box
@@ -514,9 +518,8 @@ def visualize_bbox_preds(X, pred_classes, pred_bboxes, confidences, image_size, 
     fig, axs = plt.subplots(4, 4, figsize=(15, 12))
     axs = axs.flatten()
 
-    normalize = test_transforms[-1]
-    mean = torch.tensor(normalize.mean).view(3, 1, 1) # because we have a tensor with shape [3, 244, 244], to process each channel seperately, we have to create a tensor with shape [3, 1, 1]
-    std  = torch.tensor(normalize.std).view(3, 1, 1)
+    mean = torch.tensor(test_transforms.mean).view(3, 1, 1) # because we have a tensor with shape [3, 244, 244], to process each channel seperately, we have to create a tensor with shape [3, 1, 1]
+    std  = torch.tensor(test_transforms.std).view(3, 1, 1)
 
     # as each image only has one eye and therefore one prediction, we just iterate over the first predictions/images
     for i in range(16):
@@ -544,6 +547,36 @@ def visualize_bbox_preds(X, pred_classes, pred_bboxes, confidences, image_size, 
             ax.add_patch(plt.Rectangle((x1_gt, y1_gt), w_gt, h_gt, fill=False, edgecolor='green', linewidth=2))
 
         # => torchvision.util.draw_bounding_boxes() can also draw bounding boxes in a given image
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_loss_curves(train_losses, val_losses):
+    fig, axs = plt.subplots(1, 2, figsize=(15, 5))
+
+    labels = ["Objectness Loss", "Classification Loss", "Localization Loss"]
+    colors = ["tab:blue", "tab:orange", "tab:green"]
+
+    # Left: total loss
+    axs[0].plot([epoch_losses[0] for epoch_losses in train_losses], label="Train Total", color="tab:blue")
+    axs[0].plot([epoch_losses[0] for epoch_losses in val_losses], label="Val Total", color="tab:blue", linestyle="--")
+    axs[0].set_title("Total Loss")
+    axs[0].set_xlabel("Epochs")
+    axs[0].set_ylabel("Loss")
+    axs[0].legend()
+    axs[0].grid(True, alpha=0.3)
+
+    # Right: component losses
+    for idx, (lbl, color) in enumerate(zip(labels, colors), start=1):
+        axs[1].plot([epoch_losses[idx] for epoch_losses in train_losses], label=f"Train {lbl}", color=color)
+        axs[1].plot([epoch_losses[idx] for epoch_losses in val_losses], label=f"Val {lbl}", color=color, linestyle="--")
+
+    axs[1].set_title("Component Losses")
+    axs[1].set_xlabel("Epochs")
+    axs[1].set_ylabel("Loss")
+    axs[1].legend()
+    axs[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.show()

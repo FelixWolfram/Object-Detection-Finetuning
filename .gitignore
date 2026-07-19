@@ -1,2 +1,8 @@
 # large model files
 best_models/*.pth
+
+.venv/
+__pycache__/
+.DS_Store
+
+wandb/
