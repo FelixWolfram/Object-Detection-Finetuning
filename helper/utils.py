@@ -490,7 +490,7 @@ def get_bbox_preds(batch_size, pred, image_size, threshold=0.25, nms_treshold=0.
     nms_confidences = []
 
     # as each image only has one eye and therefore one prediction, we just iterate over the first predictions/images
-    for i in range(batch_size):
+    for i in range(min(batch_size, pred.shape[0])):
         # draw the boxes around the correct objects
         pred_mask = obj_indices[:, 0] == i
         obj_conf = confidences[pred_mask] # confidence scores of all predictions above the threshold for the current image
@@ -503,7 +503,7 @@ def get_bbox_preds(batch_size, pred, image_size, threshold=0.25, nms_treshold=0.
         nms_pred_bboxes = obj_bboxes[nms_indices] # filter the bbox predictions to only keep the ones that are kept after nms
         nms_pred_conf = obj_conf[nms_indices]
 
-        nms_classes.append(nms_pred_classes)
+        nms_classes.append(nms_pred_classes.flatten())
         nms_bboxes.append(nms_pred_bboxes)
         nms_confidences.append(nms_pred_conf)
 
