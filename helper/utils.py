@@ -41,7 +41,7 @@ class CustomImageDataset(Dataset):
             try:
                 objects = f.read().strip().split("\n")
                 yolo_boxes = [[float(x.strip()) for x in obj.strip().split(" ")] for obj in objects]  # transform the string to a readable float label array
-                # annotations as lines in txt-file with no header, each line containes 5 values seperated by a space: (class_id, x_center, y_center, width, height)
+                # annotations as lines in txt-file with no header, each line contains 5 values seperated by a space: (class_id, x_center, y_center, width, height)
             except Exception as e:
                 # no object/label for this image => file is empty, so use an empty label-list as the GT-annotation
                 yolo_boxes = []
@@ -147,6 +147,8 @@ def load_default_train_transforms(image_size: int, test_transform: v2.Compose) -
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(mean=test_transform.mean, std=test_transform.std)
     ])
+    train_transforms.mean = test_transform.mean
+    train_transforms.std = test_transform.std
 
     return train_transforms
 
@@ -211,7 +213,7 @@ def get_target_maps(map_size: int, batch_size: int, y: list, device: str = DEVIC
     2. Class map - integer, the class of the object in the cell, -1 if no object is present
     3. Location map - tensor of shape (4, map_size, map_size), containing the relative coordinates and dimensions of the object in the cell
     """
-    # to get the correct 2D Feature map for the objectness "map" for each batch item, get the x_center and y_center (relative to image size) of all objects, multiple by image size (14) and store in a tensor
+    # to get the correct 2D Feature map for the objectness "map" for each batch item, get the x_center and y_center (relative to image size) of all objects => multiply by image size and store in a tensor
     obj_map = torch.zeros(batch_size, map_size, map_size).to(device)
     class_maps = torch.ones(batch_size, map_size, map_size, dtype=torch.long).to(device) * -1
     loc_maps = torch.zeros(batch_size, 4, map_size, map_size).to(device)
@@ -224,7 +226,7 @@ def get_target_maps(map_size: int, batch_size: int, y: list, device: str = DEVIC
 
             obj_map[b_idx, y_coord, x_coord] = 1
             class_maps[b_idx, y_coord, x_coord] = int(c)
-            loc_maps[b_idx, :, y_coord, x_coord] = torch.tensor([x_offset, y_offset, w, h]) # inject the id tensor along the second axis by getting all element of that pixel for alle 4 feature maps
+            loc_maps[b_idx, :, y_coord, x_coord] = torch.tensor([x_offset, y_offset, w, h]) # inject the id tensor along the second axis by getting all element of that pixel for all 4 feature maps
         
     return obj_map, class_maps, loc_maps
 
@@ -237,9 +239,9 @@ def yolo_to_bbox(yolo_box: torch.Tensor, img_size: int, map_size: int, device: s
     # yolo_box[:, 0:2] is now only the x-offset and the y-offset feature map, but for GIoU we need the absolute coordinates of x1 and y1
     x_scale_tensor = torch.arange(0, map_size).expand(map_size, -1).to(device) # arange creates vector [0, ..., map_size-1], expand duplicates that to reach shape (map_size x map_size)
     y_scale_tensor = torch.arange(0, map_size).view((-1, 1)).expand(-1, map_size).to(device) # here we need to change the row vector to a "column vector", then expand "to the right"
-    # calculate absolute x-coordinates => every column needs to be multiplied by 32 times the column index
+    # calculate absolute x-coordinates => every column index * pixel resolution of one cell + the x-offset in pixels
     abs_x = cell_width * x_scale_tensor + yolo_box[:, 0] * cell_width 
-    # calculate absolute y-coordinates => same as x-coordinate calculation but with 32 times the row index
+    # calculate absolute y-coordinates => same as x-coordinate calculation but now with multiplying each row index
     abs_y = cell_width * y_scale_tensor + yolo_box[:, 1] * cell_width
     
     # also convert relative height/width into absolute height/width
@@ -264,7 +266,7 @@ def objectness_loss(pred: torch.Tensor, target_obj: torch.Tensor, no_obj_w: floa
     loss_obj = F.binary_cross_entropy_with_logits(input=pred_obj, target=target_obj.float(), reduction="none") # this function automatically applies sigmoid function to the logits
     # as there are way more pixels with no objects, weight no object pixels less
     weight_map = torch.where(target_obj == 1, torch.ones_like(loss_obj), torch.ones_like(loss_obj) * no_obj_w) 
-    loss_obj *= weight_map # multiply by no_obj_w, where no object should be detected - inplace with masked_fill_
+    loss_obj *= weight_map # multiply by the no_obj_w, where no object should be detected and by 1 where an object should be detected
     return loss_obj.mean() # mean over all pixels and batches
 
 
@@ -272,7 +274,7 @@ def localization_loss(pred: torch.Tensor, target_loc: torch.Tensor, img_size: in
     """
     Calculates the localization loss for bounding box coordinates by applying GIoU and L2 distance penalty for width and height.
 
-    **Reason for additional L2 distnace penalty:**<br>
+    **Reason for additional L2 distance penalty:**<br>
     The additional distance penalty is necessary, because otherwise the model does not correctly localize small images. When only using the GIoU-Loss, the gradient is really small with a small IoU,
     especially if the GT bounding box is localized inside the predicted bounding box, so the ladder penalty term of the GIoU has no effect.
     A larger prior layer size additionaly increases this problem as gradients are unstable when breaking out of that plateu. Also with small boxes the GIoU-Loss can be too harsh,
@@ -281,9 +283,9 @@ def localization_loss(pred: torch.Tensor, target_loc: torch.Tensor, img_size: in
     # using GIoU + L2 distance penalty for width and height => GIoU to normalize for different sizes of objects
     # by only using GIoU tho, the model can't confidently localize small objects, which is adressed by the L2 distance penalty => encourages for smaller boxes, helping the model get out of the small gradients plateau at the beginning of training 
     yolo_pred = torch.sigmoid(pred[:, 1:5])
+    # prediction and target localization tensors have shape [64, 4, 14, 14], but for GIoU loss, shape [64, 14, 14, 4] is needed
     bbox_pred = yolo_to_bbox(yolo_pred, img_size=img_size, map_size=map_size)
     bbox_target = yolo_to_bbox(target_loc, img_size=img_size, map_size=map_size)
-    # prediction and target localization tensors have shape [64, 14, 14, 4], but for GIoU loss, shape [64, 14, 14, 4] is needed
 
     # calculated GIoU loss and widht and height L2 distance penalty
     all_giou_loss = generalized_box_iou_loss(bbox_pred, bbox_target)
@@ -304,8 +306,9 @@ def classification_loss(pred: torch.Tensor, target_class: torch.Tensor) -> torch
     # Softmax + Cross Entropy for the classification loss (only one object per cell can be detected, so only one class is possible) => loss is only calculated on cells with objectness = 1
     class_logits = pred[:, 5:]
     loss_class = F.cross_entropy(class_logits, target_class, reduction="mean", ignore_index=-1) # ignore all indices with no class assignnment (objectness = 0) => class = -1
-    # Cross Entropy loss automaticall calculates the softmax over dim =1 (softmax for each pixel between all feature maps) and compares with the correct class index with target_value = 1 for that class
-    # with standard reduction = "mean" the mean is taken over the loss for every pixel over every batch so Sum_of_BCE / (64 * 14 * 14) => the 25 dimensions from the classes are reduced to one dimension (CE loss)
+    # Cross Entropy loss automaticall calculates the softmax over dim = 1 (softmax for each pixel between all feature maps) and compares with the correct class index with target_value = 1 for that class
+    # with standard reduction = "mean" the mean is taken over the loss for every pixel over every batch so Sum_of_CE / (64 * 15 * n) => n is the number of pixels with objectness = 1; 15 the number of classes
+    # => the 15 dimensions from the classes are reduced to one dimension (CE loss)
     return loss_class
 
 
@@ -429,7 +432,7 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, wandb_projec
             if total_mean_val_batch_loss < best_val_loss:
                 best_val_loss = total_mean_val_batch_loss
                 best_model_dict = deepcopy(model.state_dict())
-                run.summary["best_val_loss"] = best_val_loss    # save the validition loss so it can be seen in the dashboard
+                run.summary["best_val_loss"] = best_val_loss    # save the validation loss so it can be seen in the dashboard
             
             log_metrics(
                 run,
@@ -465,8 +468,8 @@ def get_coords_from_pred(pred, threshold, image_size):
     cell_confs = obj_map * max_probs # to get the total confidence for each cell, multiply the cell confidence with the class probability
     obj_mask = cell_confs > threshold
     obj_indices = torch.nonzero(obj_mask, as_tuple=True)
-    # obj_indices list of length 3, each with 64 elements
-    # first element are the batch indices, second element the y-coordinates (row) and third element the x-coordinates (column) of cells with objectness > 0.2
+    # obj_indices list of length 3, containing tensors each with as many elements as there are cells in the batch with (objectness_conf * class_conf) > threshold
+    # first element are the batch indices, second element the y-coordinates (row) and third element the x-coordinates (column) of cells with (objectness_conf * class_conf) > threshold
 
     obj_classes = class_ids[obj_indices] # because obj_indices is a tuple (batch_idx_tensor, y_coord_tensor, x_coord_tensor) we can index like class_ids[batch_idx_tensor, y_coord_tensor, x_coord_tensor]
     obj_conf = cell_confs[obj_indices] 
@@ -518,7 +521,7 @@ def visualize_bbox_preds(X, pred_classes, pred_bboxes, confidences, image_size, 
     fig, axs = plt.subplots(4, 4, figsize=(15, 12))
     axs = axs.flatten()
 
-    mean = torch.tensor(test_transforms.mean).view(3, 1, 1) # because we have a tensor with shape [3, 244, 244], to process each channel seperately, we have to create a tensor with shape [3, 1, 1]
+    mean = torch.tensor(test_transforms.mean).view(3, 1, 1) # because we have a tensor with shape [3, 448, 448], to process each channel seperately, we have to create a tensor with shape [3, 1, 1]
     std  = torch.tensor(test_transforms.std).view(3, 1, 1)
 
     # as each image only has one eye and therefore one prediction, we just iterate over the first predictions/images
