@@ -591,7 +591,7 @@ def load_best_model(model, file_name_start="TrafficSign_ObjDet_", folder="best_m
     # extracting the loss on the validation dataset with a regex expression, to be able identify the best model, which will be loaded
     saved_models = [model_dict for model_dict in os.listdir(folder) if model_dict.startswith(file_name_start)]
     # search for float in the name, get only the match-string and convert to float to be able to sort (+ argmax) afterwards to get the best model index in saved_models
-    best_loss_idx = np.sort(np.array([float(re.search("[+-]?([0-9]*[.])?[0-9]+", model).group()) for model in saved_models])).argmax() 
+    best_loss_idx = np.array([float(re.search("[+-]?([0-9]*[.])?[0-9]+", model).group()) for model in saved_models]).argmin() 
     best_model_file = saved_models[best_loss_idx]
     print("Best model file:", best_model_file)
         
