@@ -1,8 +1,7 @@
 # Traffic Sign Detection via Transfer Learning (YOLOv1-style)
 
-A learning project: building an object detector from a pretrained **ResNet50** classification backbone, from scratch, without an existing detection library. 
-The goal was to actually understand how you get from *classification* to *detection* instead of just using one from `ultralytics`. The task was understanding the 
-model output needed for object detection, modifying the current ResNet50 architecture, implementing the loss function and choosing a working training strategy.
+This repository is a learning project, in which an object detector from a pretrained **ResNet50** classification backbone, from scratch, without an existing detection library is built. 
+The goal was to actually understand how you get from *classification* to *detection* instead of just using an existing one from a library like `ultralytics`. The task was understanding the model output needed for object detection, modifying the current ResNet50 architecture, implementing the loss function and choosing a working training strategy.
 
 ![Predictions vs. ground truth](assets/prediction_example.png)
 
